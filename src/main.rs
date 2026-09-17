@@ -40,8 +40,8 @@ struct Calculation {
     standard_fee: Decimal,
     fixed_fee: Decimal,
     ebay_fee: Decimal,
+    postage_paid_to_carrier: Decimal,
     k: Decimal,
-    total_costs: Decimal,
     net_profit: Decimal,
 }
 
@@ -82,7 +82,7 @@ fn run() -> io::Result<()> {
         default_zero,
     )?;
     let standard_fee_rate_percent = read_optional_decimal(
-        "7a) eBay standard final value fee rate (%) [default 13.25]: ",
+        "7a) eBay standard fee rate (%) [default 13.25]: ",
         default_standard_fee_rate_percent,
     )?;
     let fixed_fee = read_optional_decimal(
@@ -109,13 +109,9 @@ fn run() -> io::Result<()> {
         Decimal::ZERO
     };
 
-    let k = inputs.item_cost.value
-        + inputs.supplies_cost.value
-        + if inputs.customer_pays_shipping {
-            Decimal::ZERO
-        } else {
-            inputs.shipping_amount.value
-        };
+    let postage_paid_to_carrier = inputs.shipping_amount.value;
+
+    let k = inputs.item_cost.value + inputs.supplies_cost.value;
 
     let t = percent_to_decimal(inputs.tax_rate_percent.value);
     let f = percent_to_decimal(inputs.standard_fee_rate_percent.value);
@@ -124,37 +120,42 @@ fn run() -> io::Result<()> {
     // Algebra (single closed-form solve, no iteration):
     // Let M = (customer pays shipping ? S : 0)
     // Let D = fixed fee dollars
+    // Let A = postage paid to carrier
     // subtotal_plus_ship = P + M
-    // tax                = (P + M) * T
-    // fee_base           = (P + M) + tax
+    // tax                = P * T
+    // fee_base           = subtotal_plus_ship + tax = P + M + P*T
     // standard_fee       = fee_base * F
     // fixed_fee          = D
     // ebay_fee           = standard_fee + fixed_fee
-    // net                = P + M - tax - ebay_fee - K
-    //                    = (P + M) * (1 - T - F - T*F) - D - K
-    // target_profit      = (P + M) * A - D - K, where A = (1 - T - F - T*F)
-    // => P = (target_profit + D + K) / A - M
-    let a = Decimal::ONE - t - f - (t * f);
+    // net                = P + M - ebay_fee - K - A
+    //                    = P + M - (P + M + P*T)*F - D - K - A
+    //                    = P*(1 - F - T*F) + M*(1 - F) - D - K - A
+    // target_profit      = P*B + M*(1 - F) - D - K - A, where B = (1 - F - T*F)
+    // target_profit + D + K + A - M*(1 - F) = P*B
+    // => P = (target_profit + D + K + A - M*(1 - F)) / B
+    let b = Decimal::ONE - f - (t * f);
 
-    if a <= Decimal::ZERO {
+    if b <= Decimal::ZERO {
         println!();
         println!("Unable to compute a valid sale price with the current rates.");
         println!(
             "The combined tax/fee factor makes the denominator <= 0 (A = {}).",
-            a.round_dp(6)
+            b.round_dp(6)
         );
         println!("Try lower tax and/or fee rates.");
         print_input_summary(&inputs, k);
         return Ok(());
     }
 
-    let raw_price = (target_profit_amt + d + k) / a - shipping_collected;
+    let raw_price = (target_profit_amt + d + k + postage_paid_to_carrier
+        - (shipping_collected * (Decimal::ONE - f)))
+        / b;
     let recommended_price = round_up_to_cent(non_negative(raw_price));
     let calc = recompute(recommended_price, &inputs);
 
     println!();
     println!("================ RECOMMENDED SALE PRICE ================");
-    println!("                 ${}", fmt_money(recommended_price));
+    println!("                 {}", fmt_money(recommended_price));
     println!("========================================================");
 
     print_input_summary(&inputs, calc.k);
@@ -169,7 +170,7 @@ fn read_required_target_profit(default_value: Decimal) -> io::Result<InputValue>
         let trimmed = raw.trim();
 
         if trimmed.is_empty() {
-            println!("No target profit entered. Using default: ${}", fmt_money(default_value));
+            println!("No target profit entered. Using default: {}", fmt_money(default_value));
             return Ok(InputValue {
                 value: default_value,
                 defaulted: true,
@@ -210,7 +211,7 @@ fn read_optional_decimal(prompt_text: &str, default_value: Decimal) -> io::Resul
         }),
         None => {
             println!(
-                "Warning: invalid optional value '{}'. Using default ${}.",
+                "Warning: invalid optional value '{}'. Using default {}.",
                 trimmed,
                 fmt_money(default_value)
             );
@@ -281,22 +282,16 @@ fn recompute(price: Decimal, inputs: &Inputs) -> Calculation {
     let t = percent_to_decimal(inputs.tax_rate_percent.value);
     let f = percent_to_decimal(inputs.standard_fee_rate_percent.value);
 
-    let tax = subtotal_plus_ship * t;
+    let tax = price * t;
     let fee_base = subtotal_plus_ship + tax;
     let standard_fee = fee_base * f;
     let fixed_fee = inputs.fixed_fee.value;
     let ebay_fee = standard_fee + fixed_fee;
+    let postage_paid_to_carrier = inputs.shipping_amount.value;
 
-    let k = inputs.item_cost.value
-        + inputs.supplies_cost.value
-        + if inputs.customer_pays_shipping {
-            Decimal::ZERO
-        } else {
-            inputs.shipping_amount.value
-        };
+    let k = inputs.item_cost.value + inputs.supplies_cost.value;
 
-    let net_profit = price + shipping_collected - tax - ebay_fee - k;
-    let total_costs = tax + ebay_fee + k;
+    let net_profit = price + shipping_collected - ebay_fee - k - postage_paid_to_carrier;
 
     Calculation {
         subtotal_plus_ship,
@@ -305,8 +300,8 @@ fn recompute(price: Decimal, inputs: &Inputs) -> Calculation {
         standard_fee,
         fixed_fee,
         ebay_fee,
+        postage_paid_to_carrier,
         k,
-        total_costs,
         net_profit,
     }
 }
@@ -325,12 +320,15 @@ fn non_negative(value: Decimal) -> Decimal {
 
 fn fmt_money(value: Decimal) -> String {
     let rounded = value.round_dp(2);
-    format!("{rounded:.2}")
+    format!("${rounded:.2}")
 }
 
 fn fmt_percent(value: Decimal) -> String {
-    let rounded = value.round_dp(4);
-    format!("{rounded:.4}")
+    let mut s = value.normalize().to_string();
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
 }
 
 fn line(label: &str, value: &str, defaulted: bool) {
@@ -344,17 +342,17 @@ fn print_input_summary(inputs: &Inputs, k: Decimal) {
     println!("-------------");
     line(
         "Target profit:",
-        &format!("${}", fmt_money(inputs.target_profit.value)),
+        &fmt_money(inputs.target_profit.value),
         inputs.target_profit.defaulted,
     );
     line(
         "Initial item cost:",
-        &format!("${}", fmt_money(inputs.item_cost.value)),
+        &fmt_money(inputs.item_cost.value),
         inputs.item_cost.defaulted,
     );
     line(
         "Shipping/supply out-of-pocket costs:",
-        &format!("${}", fmt_money(inputs.supplies_cost.value)),
+        &fmt_money(inputs.supplies_cost.value),
         inputs.supplies_cost.defaulted,
     );
     line(
@@ -363,8 +361,8 @@ fn print_input_summary(inputs: &Inputs, k: Decimal) {
         inputs.customer_pays_shipping_defaulted,
     );
     line(
-        "Shipping amount (S):",
-        &format!("${}", fmt_money(inputs.shipping_amount.value)),
+        "Shipping / postage amount:",
+        &fmt_money(inputs.shipping_amount.value),
         inputs.shipping_amount.defaulted,
     );
     line(
@@ -373,46 +371,79 @@ fn print_input_summary(inputs: &Inputs, k: Decimal) {
         inputs.tax_rate_percent.defaulted,
     );
     line(
-        "eBay standard final value fee rate:",
+        "eBay standard fee rate:",
         &format!("{}%", fmt_percent(inputs.standard_fee_rate_percent.value)),
         inputs.standard_fee_rate_percent.defaulted,
     );
     line(
         "eBay fixed final value fee:",
-        &format!("${}", fmt_money(inputs.fixed_fee.value)),
+        &fmt_money(inputs.fixed_fee.value),
         inputs.fixed_fee.defaulted,
     );
-    println!("{:<52} {:>14}", "Computed seller out-of-pocket costs (K):", format!("${}", fmt_money(k)));
+    println!("{:<52} {:>14}", "Computed seller out-of-pocket costs (K):", fmt_money(k));
 }
 
 fn print_result_summary(price: Decimal, calc: Calculation, inputs: &Inputs) {
     println!();
     println!("Computation At Recommended Price");
     println!("--------------------------------");
-    println!("{:<52} {:>14}", "Recommended sale price (P):", format!("${}", fmt_money(price)));
+    println!("{:<52} {:>14}", "Recommended sale price (P):", fmt_money(price));
     println!(
         "{:<52} {:>14}",
-        "Subtotal + shipping used for tax:",
-        format!("${}", fmt_money(calc.subtotal_plus_ship))
+        "Taxable subtotal (P):",
+        fmt_money(price)
     );
-    println!("{:<52} {:>14}", "Sales tax:", format!("${}", fmt_money(calc.tax)));
-    println!("{:<52} {:>14}", "Fee base:", format!("${}", fmt_money(calc.fee_base)));
+    println!(
+        "{:<52} {:>14}",
+        &format!(
+            "Sales tax ({} of taxable subtotal):",
+            format!("{}%", fmt_percent(inputs.tax_rate_percent.value))
+        ),
+        fmt_money(calc.tax)
+    );
+    println!("{:<52} {:>14}", "Shipping in fee base (S):", fmt_money(calc.subtotal_plus_ship - price));
+    println!(
+        "{:<52} {:>14}",
+        "eBay fee base (subtotal + shipping + tax):",
+        fmt_money(calc.fee_base)
+    );
     let standard_fee_label = format!(
-        "Standard final value fee ({}% of ${}):",
+        "Standard fee ({}% of {}):",
         fmt_percent(inputs.standard_fee_rate_percent.value),
         fmt_money(calc.fee_base)
     );
     println!(
         "{:<52} {:>14}",
         standard_fee_label,
-        format!("${}", fmt_money(calc.standard_fee))
+        fmt_money(calc.standard_fee)
     );
     println!(
         "{:<52} {:>14}",
         "Fixed final value fee:",
-        format!("${}", fmt_money(calc.fixed_fee))
+        fmt_money(calc.fixed_fee)
     );
-    println!("{:<52} {:>14}", "eBay fee total:", format!("${}", fmt_money(calc.ebay_fee)));
-    println!("{:<52} {:>14}", "Total costs (tax + fee + K):", format!("${}", fmt_money(calc.total_costs)));
-    println!("{:<52} {:>14}", "Final net profit:", format!("${}", fmt_money(calc.net_profit)));
+    println!("{:<52} {:>14}", "eBay fee total:", fmt_money(calc.ebay_fee));
+    println!(
+        "{:<52} {:>14}",
+        "Sales tax collected from buyer (remitted to state, not a seller cost):",
+        fmt_money(calc.tax)
+    );
+    println!("{:<52} {:>14}", "Gross received (P + S):", fmt_money(calc.subtotal_plus_ship));
+    println!(
+        "{:<52} {:>14}",
+        "Less: eBay fee total:",
+        format!("-{}", fmt_money(calc.ebay_fee))
+    );
+    println!(
+        "{:<52} {:>14}",
+        "Less: postage paid to carrier (A):",
+        format!("-{}", fmt_money(calc.postage_paid_to_carrier))
+    );
+    println!(
+        "{:<52} {:>14}",
+        "Less: seller out-of-pocket costs (K):",
+        format!("-{}", fmt_money(calc.k))
+    );
+    println!("{:<52} {:>14}", "", "--------------");
+    println!("{:<52} {:>14}", "Final net profit:", fmt_money(calc.net_profit));
 }
